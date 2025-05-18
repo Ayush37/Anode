@@ -280,174 +280,209 @@ class RDSMonitor:
             
         return df
     
-    def detect_anomalies_arima(self, metric_name, confidence=0.99, detection_window=24):
-        """
-        Detect anomalies in the metric data using ARIMA modeling.
+def detect_anomalies_arima(self, metric_name, confidence=0.99, detection_window=24):
+    """
+    Detect anomalies in the metric data using ARIMA modeling.
+    
+    Args:
+        metric_name: The name of the CloudWatch metric to analyze
+        confidence: Confidence level for anomaly detection (default: 0.99)
+        detection_window: Number of recent data points to check for anomalies (default: 24)
         
-        Args:
-            metric_name: The name of the CloudWatch metric to analyze
-            confidence: Confidence level for anomaly detection (default: 0.99)
-            detection_window: Number of recent data points to check for anomalies (default: 24)
+    Returns:
+        List of anomalies with timestamps and values
+    """
+    # Get metric data
+    df = self.get_metric_data(metric_name)
+    if df is None or len(df) < 30:  # Need sufficient data for ARIMA
+        logger.warning(f"Insufficient data for {metric_name} ARIMA analysis")
+        return []
+    
+    # Set timestamp as index for time series analysis
+    df = df.set_index('timestamp')
+    
+    # Quick data quality check
+    logger.info(f"Data statistics for {metric_name}:")
+    logger.info(f"  Min: {df['value'].min():.6f}")
+    logger.info(f"  Max: {df['value'].max():.6f}")
+    logger.info(f"  Mean: {df['value'].mean():.6f}")
+    logger.info(f"  Std Dev: {df['value'].std():.6f}")
+    
+    # Check if we have enough data for detection window
+    if len(df) <= detection_window:
+        detection_window = max(1, len(df) // 4)  # Fall back to 25% of data if not enough
+        logger.warning(f"Adjusted detection window to {detection_window} due to limited data")
+    
+    train_data = df.iloc[:-detection_window]
+    test_data = df.iloc[-detection_window:]
+    
+    logger.info(f"Training data points: {len(train_data)}")
+    logger.info(f"Test data points: {len(test_data)}")
+    
+    # Check if training data is too small
+    if len(train_data) < 10:
+        logger.warning(f"Training data too small for {metric_name} ARIMA analysis")
+        return []
+    
+    # Check if the time series is stationary
+    try:
+        result = adfuller(train_data['value'].dropna())
+        logger.info(f"ADF Statistic: {result[0]:.6f}")
+        logger.info(f"p-value: {result[1]:.6f}")
+        
+        d = 0
+        if result[1] > 0.05:  # p-value > 0.05 means non-stationary
+            d = 1  # Set differencing parameter
+            logger.info(f"Series is non-stationary (p > 0.05), setting d=1 for ARIMA")
+        else:
+            logger.info(f"Series is stationary (p <= 0.05), setting d=0 for ARIMA")
+    except Exception as e:
+        logger.warning(f"Error in stationarity test: {e}")
+        d = 1  # Default to 1st order differencing in case of error
+        
+    anomalies = []
+    
+    try:
+        # Fit ARIMA model (p=1, d=determined, q=1) on training data
+        logger.info(f"Fitting ARIMA(1,{d},1) model on {len(train_data)} data points")
+        model = ARIMA(train_data['value'], order=(1, d, 1))
+        model_fit = model.fit()
+        
+        if self.debug:
+            logger.debug(f"ARIMA model summary:\n{model_fit.summary()}")
+        
+        # Forecast for the test window
+        logger.info(f"Forecasting {len(test_data)} steps ahead")
+        forecast_result = model_fit.forecast(steps=len(test_data))
+        
+        # Fix: Convert forecast to list if it's a pandas Series
+        if isinstance(forecast_result, pd.Series):
+            forecast_values = forecast_result.values
+        else:
+            forecast_values = np.array(forecast_result)
             
-        Returns:
-            List of anomalies with timestamps and values
-        """
-        # Get metric data
-        df = self.get_metric_data(metric_name)
-        if df is None or len(df) < 30:  # Need sufficient data for ARIMA
-            logger.warning(f"Insufficient data for {metric_name} ARIMA analysis")
-            return []
+        logger.info(f"Generated {len(forecast_values)} forecast values")
         
-        # Set timestamp as index for time series analysis
-        df = df.set_index('timestamp')
+        # Calculate the residuals and their standard deviation from training data
+        residuals = model_fit.resid
+        resid_std = np.std(residuals)
+        logger.info(f"Residual standard deviation: {resid_std:.6f}")
         
-        # Quick data quality check
-        logger.info(f"Data statistics for {metric_name}:")
-        logger.info(f"  Min: {df['value'].min():.6f}")
-        logger.info(f"  Max: {df['value'].max():.6f}")
-        logger.info(f"  Mean: {df['value'].mean():.6f}")
-        logger.info(f"  Std Dev: {df['value'].std():.6f}")
+        # Calculate confidence interval
+        z_score = abs(np.log(1 / (1 - confidence)))
+        margin = z_score * resid_std
+        logger.info(f"Using {confidence*100}% confidence interval (margin: ±{margin:.6f})")
         
-        # Check if we have enough data for detection window
-        if len(df) <= detection_window:
-            detection_window = max(1, len(df) // 4)  # Fall back to 25% of data if not enough
-            logger.warning(f"Adjusted detection window to {detection_window} due to limited data")
+        # Compare actual values with forecasts
+        anomaly_detected = False
+        consecutive_anomalies = 0
+        min_consecutive = 2  # Require at least 2 consecutive anomalies to reduce false positives
         
-        train_data = df.iloc[:-detection_window]
-        test_data = df.iloc[-detection_window:]
+        logger.info(f"Checking {len(test_data)} points for anomalies")
         
-        logger.info(f"Training data points: {len(train_data)}")
-        logger.info(f"Test data points: {len(test_data)}")
+        # Print first few actual vs forecast values in debug mode
+        if self.debug and len(test_data) > 0 and len(forecast_values) > 0:
+            sample_size = min(5, len(test_data), len(forecast_values))
+            logger.debug("Sample actual vs forecast values:")
+            for i in range(sample_size):
+                idx = test_data.index[i]
+                actual = test_data['value'].iloc[i]
+                predicted = forecast_values[i]
+                logger.debug(f"  Point {i}: {idx} - Actual: {actual:.6f}, Forecast: {predicted:.6f}, " +
+                            f"Range: [{predicted-margin:.6f}, {predicted+margin:.6f}]")
         
-        # Check if the time series is stationary
-        try:
-            result = adfuller(train_data['value'].dropna())
-            logger.info(f"ADF Statistic: {result[0]:.6f}")
-            logger.info(f"p-value: {result[1]:.6f}")
+        # Verify we have enough forecast values
+        if len(forecast_values) < len(test_data):
+            logger.warning(f"Forecast length ({len(forecast_values)}) is less than test data length ({len(test_data)})")
+            # Adjust test_data to match forecast_values length
+            test_data = test_data.iloc[:len(forecast_values)]
             
-            d = 0
-            if result[1] > 0.05:  # p-value > 0.05 means non-stationary
-                d = 1  # Set differencing parameter
-                logger.info(f"Series is non-stationary (p > 0.05), setting d=1 for ARIMA")
+        # Convert test_data to list for easier iteration
+        test_indices = test_data.index.tolist()
+        test_values = test_data['value'].tolist()
+        
+        # Iterate through test data and forecasts
+        for i in range(len(test_values)):
+            idx = test_indices[i]
+            actual = test_values[i]
+            
+            # Safe access to forecast values
+            if i < len(forecast_values):
+                predicted = forecast_values[i]
             else:
-                logger.info(f"Series is stationary (p <= 0.05), setting d=0 for ARIMA")
-        except Exception as e:
-            logger.warning(f"Error in stationarity test: {e}")
-            d = 1  # Default to 1st order differencing in case of error
-            
-        anomalies = []
-        
-        try:
-            # Fit ARIMA model (p=1, d=determined, q=1) on training data
-            logger.info(f"Fitting ARIMA(1,{d},1) model on {len(train_data)} data points")
-            model = ARIMA(train_data['value'], order=(1, d, 1))
-            model_fit = model.fit()
-            
-            if self.debug:
-                logger.debug(f"ARIMA model summary:\n{model_fit.summary()}")
-            
-            # Forecast for the test window
-            logger.info(f"Forecasting {len(test_data)} steps ahead")
-            forecast = model_fit.forecast(steps=len(test_data))
-            
-            # Calculate the residuals and their standard deviation from training data
-            residuals = model_fit.resid
-            resid_std = np.std(residuals)
-            logger.info(f"Residual standard deviation: {resid_std:.6f}")
-            
-            # Calculate confidence interval
-            z_score = abs(np.log(1 / (1 - confidence)))
-            margin = z_score * resid_std
-            logger.info(f"Using {confidence*100}% confidence interval (margin: ±{margin:.6f})")
-            
-            # Compare actual values with forecasts
-            anomaly_detected = False
-            consecutive_anomalies = 0
-            min_consecutive = 2  # Require at least 2 consecutive anomalies to reduce false positives
-            
-            logger.info(f"Checking {len(test_data)} points for anomalies")
-            
-            # Print first few actual vs forecast values in debug mode
-            if self.debug and len(test_data) > 0:
-                sample_size = min(5, len(test_data))
-                logger.debug("Sample actual vs forecast values:")
-                for i in range(sample_size):
-                    idx = test_data.index[i]
-                    actual = test_data['value'].iloc[i]
-                    predicted = forecast[i]
-                    logger.debug(f"  Point {i}: {idx} - Actual: {actual:.6f}, Forecast: {predicted:.6f}, " +
-                                f"Range: [{predicted-margin:.6f}, {predicted+margin:.6f}]")
-            
-            for i, (idx, actual) in enumerate(test_data['value'].items()):
-                # Get the predicted value for this time point
-                predicted = forecast[i]
-                lower_bound = predicted - margin
-                upper_bound = predicted + margin
+                logger.warning(f"Missing forecast for index {i}, skipping")
+                continue
                 
-                # Check if the actual value is outside the confidence interval
-                is_point_anomaly = (actual < lower_bound) or (actual > upper_bound)
+            lower_bound = predicted - margin
+            upper_bound = predicted + margin
+            
+            # Check if the actual value is outside the confidence interval
+            is_point_anomaly = (actual < lower_bound) or (actual > upper_bound)
+            
+            # Handle anomaly tracking
+            if is_point_anomaly:
+                consecutive_anomalies += 1
+                logger.info(f"Potential anomaly at {idx}: Actual={actual:.6f}, " +
+                           f"Predicted={predicted:.6f}, Range=[{lower_bound:.6f}, {upper_bound:.6f}]")
                 
-                # Handle anomaly tracking
-                if is_point_anomaly:
-                    consecutive_anomalies += 1
-                    logger.info(f"Potential anomaly at {idx}: Actual={actual:.6f}, " +
-                               f"Predicted={predicted:.6f}, Range=[{lower_bound:.6f}, {upper_bound:.6f}]")
-                    
-                    # Only record as anomaly if we have consecutive anomalies
-                    if consecutive_anomalies >= min_consecutive:
-                        if not anomaly_detected:
-                            # First time we're detecting this anomaly period
-                            anomaly_detected = True
-                            # Record the start of the anomaly (min_consecutive points back)
-                            anomaly_start_idx = max(0, i - consecutive_anomalies + 1)
-                            anomaly_start_time = test_data.index[anomaly_start_idx]
-                            
-                            anomaly = {
-                                'metric': metric_name,
-                                'start_timestamp': anomaly_start_time,
-                                'latest_timestamp': idx,
-                                'actual_value': actual,
-                                'expected_value': predicted,
-                                'lower_bound': lower_bound,
-                                'upper_bound': upper_bound,
-                                'deviation': abs(actual - predicted),
-                                'percentage_change': abs((actual - predicted) / predicted) * 100 if predicted != 0 else float('inf')
-                            }
-                            anomalies.append(anomaly)
-                            logger.info(f"ANOMALY DETECTED: {metric_name} starting at {anomaly_start_time}")
-                            logger.info(f"  Current: {actual:.6f}, Expected: {predicted:.6f}, " +
-                                       f"Range: [{lower_bound:.6f}, {upper_bound:.6f}]")
+                # Only record as anomaly if we have consecutive anomalies
+                if consecutive_anomalies >= min_consecutive:
+                    if not anomaly_detected:
+                        # First time we're detecting this anomaly period
+                        anomaly_detected = True
+                        # Record the start of the anomaly (min_consecutive points back)
+                        anomaly_start_idx = max(0, i - consecutive_anomalies + 1)
+                        if anomaly_start_idx < len(test_indices):
+                            anomaly_start_time = test_indices[anomaly_start_idx]
                         else:
-                            # Update the existing anomaly with the latest timestamp
-                            anomalies[-1]['latest_timestamp'] = idx
+                            anomaly_start_time = idx  # Fallback
+                        
+                        anomaly = {
+                            'metric': metric_name,
+                            'start_timestamp': anomaly_start_time,
+                            'latest_timestamp': idx,
+                            'actual_value': actual,
+                            'expected_value': predicted,
+                            'lower_bound': lower_bound,
+                            'upper_bound': upper_bound,
+                            'deviation': abs(actual - predicted),
+                            'percentage_change': abs((actual - predicted) / predicted) * 100 if predicted != 0 else float('inf')
+                        }
+                        anomalies.append(anomaly)
+                        logger.info(f"ANOMALY DETECTED: {metric_name} starting at {anomaly_start_time}")
+                        logger.info(f"  Current: {actual:.6f}, Expected: {predicted:.6f}, " +
+                                   f"Range: [{lower_bound:.6f}, {upper_bound:.6f}]")
+                    else:
+                        # Update the existing anomaly with the latest timestamp
+                        anomalies[-1]['latest_timestamp'] = idx
+                        
+                        # Update if this is a more severe deviation
+                        if abs(actual - predicted) > anomalies[-1]['deviation']:
+                            anomalies[-1]['actual_value'] = actual
+                            anomalies[-1]['expected_value'] = predicted
+                            anomalies[-1]['lower_bound'] = lower_bound
+                            anomalies[-1]['upper_bound'] = upper_bound
+                            anomalies[-1]['deviation'] = abs(actual - predicted)
                             
-                            # Update if this is a more severe deviation
-                            if abs(actual - predicted) > anomalies[-1]['deviation']:
-                                anomalies[-1]['actual_value'] = actual
-                                anomalies[-1]['expected_value'] = predicted
-                                anomalies[-1]['lower_bound'] = lower_bound
-                                anomalies[-1]['upper_bound'] = upper_bound
-                                anomalies[-1]['deviation'] = abs(actual - predicted)
-                                
-                                percentage_change = abs((actual - predicted) / predicted) * 100 if predicted != 0 else float('inf')
-                                anomalies[-1]['percentage_change'] = percentage_change
-                else:
-                    # Reset streak if we see a normal value
-                    if consecutive_anomalies > 0:
-                        logger.info(f"Normal value at {idx}: Anomaly streak ended after {consecutive_anomalies} points")
-                    consecutive_anomalies = 0
-                    anomaly_detected = False
-                
-            if not anomalies:
-                logger.info(f"No anomalies detected for {metric_name}")
-                
-            return anomalies
-                
-        except Exception as e:
-            logger.error(f"Error in ARIMA analysis for {metric_name}: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return []
+                            percentage_change = abs((actual - predicted) / predicted) * 100 if predicted != 0 else float('inf')
+                            anomalies[-1]['percentage_change'] = percentage_change
+            else:
+                # Reset streak if we see a normal value
+                if consecutive_anomalies > 0:
+                    logger.info(f"Normal value at {idx}: Anomaly streak ended after {consecutive_anomalies} points")
+                consecutive_anomalies = 0
+                anomaly_detected = False
+            
+        if not anomalies:
+            logger.info(f"No anomalies detected for {metric_name}")
+            
+        return anomalies
+            
+    except Exception as e:
+        logger.error(f"Error in ARIMA analysis for {metric_name}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return []
     
     def monitor_all_metrics(self):
         """
